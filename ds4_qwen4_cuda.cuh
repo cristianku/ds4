@@ -1181,11 +1181,57 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     }
 }
 
+/* Decode each packed Q6_K quartet once, sharing it across verification rows.
+ * Keep FP32 activations and the same lane-wise accumulation order as dot(). */
+template<unsigned ROWS>
+__global__ void matvec_q6(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x*4+threadIdx.x/32, lane = threadIdx.x&31;
+    if (row >= M) return;
+    const uint8_t *wr = (const uint8_t *)w+(uint64_t)row*stride;
+    float acc[ROWS] = {};
+    for (unsigned block = 0; block < K/256; block++) {
+        const uint8_t *b = wr+(uint64_t)block*210;
+        const float d = __half2float(*(const __half *)(b+208));
+        #pragma unroll
+        for (unsigned half = 0; half < 2; half++) {
+            const unsigned l0 = b[half*64+lane], l1 = b[half*64+32+lane];
+            const unsigned hi = b[128+half*32+lane];
+            const int8_t *sc = (const int8_t *)(b+192+half*8+lane/16);
+            const float w0 = (d*sc[0])*(float)((int)((l0&15)|((hi&3)<<4))-32);
+            const float w1 = (d*sc[2])*(float)((int)((l1&15)|(((hi>>2)&3)<<4))-32);
+            const float w2 = (d*sc[4])*(float)((int)((l0>>4)|(((hi>>4)&3)<<4))-32);
+            const float w3 = (d*sc[6])*(float)((int)((l1>>4)|(((hi>>6)&3)<<4))-32);
+            #pragma unroll
+            for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+                const float *v = x+(uint64_t)t*K+block*256+half*128+lane;
+                acc[t] += w0*v[0]; acc[t] += w1*v[32];
+                acc[t] += w2*v[64]; acc[t] += w3*v[96];
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(acc[t]);
+        if (!lane) out[(uint64_t)t*M+row] = v;
+    }
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
+    /* Diagnostic scalar path for numerical and performance comparisons. */
+    if (type == 14 && T <= 8 && !getenv("DS4_QWEN4_Q6_K_SCALAR")) {
+#define QWEN_Q6_ROWS(N) matvec_q6<N><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
+        if (T == 1) { QWEN_Q6_ROWS(1); }
+        else if (T == 2) { QWEN_Q6_ROWS(2); }
+        else if (T <= 4) { QWEN_Q6_ROWS(4); }
+        else { QWEN_Q6_ROWS(8); }
+#undef QWEN_Q6_ROWS
+        return launched();
+    }
     if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
 #define QWEN_Q8_ROWS(N) matvec_q8<N><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
         if (T == 1) { QWEN_Q8_ROWS(1); }

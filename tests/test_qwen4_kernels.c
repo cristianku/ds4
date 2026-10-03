@@ -3518,7 +3518,7 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
 
 #ifndef __APPLE__
 static void test_dense_mm_q6_K(arena_t *a) {
-    const uint32_t tokens[] = {1, 2, 4, 8, 9, 17, 32, 33, 65};
+    const uint32_t tokens[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 32, 33, 65};
     for (unsigned i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++)
         test_dense_mm(a, 512, 19, tokens[i], 14u);
     /* The 27B's vocabulary projection has an input width of 5120. */
