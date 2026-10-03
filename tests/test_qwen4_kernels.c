@@ -3463,10 +3463,39 @@ static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_
 
 #endif
 
-/* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
+/* Build Q6_K from independent signed values, retaining those values as the
+ * oracle. This catches nibble, high-bit and signed subscale decoding errors. */
+static uint64_t arena_q6_K(arena_t *a, uint32_t rows, uint32_t cols, double **shadow) {
+    require_ok(cols % 256 == 0, "Q6_K block alignment");
+    const uint64_t off = arena_alloc(a, (uint64_t)rows * (cols / 256) * 210);
+    uint8_t *packed = a->base + off;
+    *shadow = malloc((uint64_t)rows * cols * sizeof(**shadow));
+    require_ok(*shadow != NULL, "Q6_K reference allocation");
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t block = 0; block < cols / 256; block++, packed += 210) {
+            memset(packed, 0, 210);
+            const uint16_t dh = f32_to_f16(0.001953125f);
+            memcpy(packed + 208, &dh, sizeof(dh));
+            for (unsigned sub = 0; sub < 16; sub++)
+                packed[192 + sub] = (uint8_t)(int8_t)((int)((sub * 17 + row + block) % 255) - 127);
+            for (unsigned i = 0; i < 256; i++) {
+                const unsigned half = i / 128, group = i % 128 / 32, lane = i % 32;
+                const unsigned q = (i * 13 + row * 7 + block * 11) % 64;
+                packed[half * 64 + (group % 2) * 32 + lane] |= (uint8_t)((q & 15) << (4 * (group / 2)));
+                packed[128 + half * 32 + lane] |= (uint8_t)((q >> 4) << (2 * group));
+                (*shadow)[(uint64_t)row * cols + block * 256 + i] =
+                    (double)f16_to_f32(dh) * (int8_t)packed[192 + i / 16] * ((int)q - 32);
+            }
+        }
+    }
+    return off;
+}
+
+/* Dense projections against an independent double reference. */
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
-    uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
+    uint64_t off = wtype == 14u ? arena_q6_K(a, rows, in_dim, &sh)
+                 : wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
                  : wtype == 1u ? arena_f16(a, (uint64_t)rows * in_dim, &sh, 0.05f)
                                : arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f);
     float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
@@ -3488,6 +3517,15 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
 }
 
 #ifndef __APPLE__
+static void test_dense_mm_q6_K(arena_t *a) {
+    const uint32_t tokens[] = {1, 2, 4, 8, 9, 17, 32, 33, 65};
+    for (unsigned i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++)
+        test_dense_mm(a, 512, 19, tokens[i], 14u);
+    /* The 27B's vocabulary projection has an input width of 5120. */
+    test_dense_mm(a, 5120, 19, 1, 14u);
+    test_dense_mm(a, 5120, 19, 4, 14u);
+}
+
 /* Cross the former 64 MiB output-tile limit with odd output strides. Reuse
  * 17 independent input rows so the full CPU oracle stays inexpensive. */
 static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
@@ -3540,7 +3578,13 @@ int main(void) {
 
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_Q6K_ONLY")) {
+        test_dense_mm_q6_K(&arena);
+        printf("all Qwen CUDA Q6_K projection tests passed\n");
+        return 0;
+    }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
+        test_dense_mm_q6_K(&arena);
         test_dense_mm_large(&arena, 1u);
         test_dense_mm_large(&arena, 8u);
         test_dense_mm(&arena, 10240, 1700, 32, 8u);
@@ -3680,6 +3724,7 @@ int main(void) {
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);
 #ifndef __APPLE__
+    test_dense_mm_q6_K(&arena);
     test_half_expert_tiles(&arena,33,16,10,64);
     test_half_expert_tiles(&arena,2049,16,10,64);
     test_half_expert_tiles(&arena,8193,16,10,64);

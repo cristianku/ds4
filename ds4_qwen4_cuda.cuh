@@ -362,6 +362,7 @@ static uint64_t row_bytes(uint32_t type, uint64_t n) {
     case 39: return n % 32 ? 0 : n / 32 * 17;
     case 10: return n % 256 ? 0 : n / 256 * 84;
     case 12: return n % 256 ? 0 : n / 256 * 144;
+    case 14: return n % 256 ? 0 : n / 256 * 210;
     case 16: return n % 256 ? 0 : n / 256 * 66;
     default: return 0;
     }
@@ -440,6 +441,17 @@ __device__ __forceinline__ float value(const char *row, unsigned i,
         }
         const unsigned q = (b->qs[j / 64 * 32 + j % 32] >> (4 * (group & 1))) & 15;
         return dev_f16_to_f32(b->d) * sc * q - dev_f16_to_f32(b->dmin) * mn;
+    }
+    if (TYPE == 14) {
+        /* Q6_K stores four groups of 32 values per 128-value half, with
+         * signed scales for each 16-value subblock. Keep the GGUF values
+         * intact for the vocabulary projection and attention outputs. */
+        const uint8_t *b = (const uint8_t *)row + (i / 256) * 210;
+        const unsigned j = i % 256, half = j / 128, group = j % 128 / 32, lane = j % 32;
+        const unsigned lo = (b[half * 64 + (group & 1) * 32 + lane] >> (4 * (group / 2))) & 15;
+        const unsigned hi = (b[128 + half * 32 + lane] >> (2 * group)) & 3;
+        return __half2float(*(const __half *)(b + 208)) *
+            (float)((const int8_t *)b)[192 + j / 16] * (float)((int)(lo | (hi << 4)) - 32);
     }
     if (TYPE == 16) {
         const cuda_block_iq2_xxs *b = (const cuda_block_iq2_xxs *)row + i / 256;
@@ -1067,7 +1079,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         else matrix_reg<TYPE,false,2><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); break
         switch (type) {
         QWEN_TC(0); QWEN_TC(1); QWEN_TC(2); QWEN_TC(8); QWEN_TC(10);
-        QWEN_TC(12); QWEN_TC(16); QWEN_TC(30); QWEN_TC(39);
+        QWEN_TC(12); QWEN_TC(14); QWEN_TC(16); QWEN_TC(30); QWEN_TC(39);
         default: return 0;
         }
 #undef QWEN_TC
@@ -1079,7 +1091,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     else matrix<TYPE,false,true><<<grid,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); break
     switch (type) {
     QWEN_MM(0); QWEN_MM(1); QWEN_MM(2); QWEN_MM(8); QWEN_MM(10);
-    QWEN_MM(12); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
+    QWEN_MM(12); QWEN_MM(14); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
     default: return 0;
     }
 #undef QWEN_MM
@@ -1190,7 +1202,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     else matvec<TYPE><<<grid,128,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); break
     switch (type) {
     QWEN_MV(0); QWEN_MV(1); QWEN_MV(2); QWEN_MV(8); QWEN_MV(10);
-    QWEN_MV(12); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
+    QWEN_MV(12); QWEN_MV(14); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
     default: return 0;
     }
 #undef QWEN_MV
@@ -1369,7 +1381,7 @@ static int dense_blas(float *out, const float *x, const char *w,
 #define QWEN_UNPACK(TYPE) case TYPE: unpack<TYPE><<<((uint64_t)n*K+255)/256,256,0,cuda_decode_stream()>>>(scratch,w+(uint64_t)r*rb,K,n,rb); break
             switch (type) {
             QWEN_UNPACK(1); QWEN_UNPACK(2); QWEN_UNPACK(8); QWEN_UNPACK(10);
-            QWEN_UNPACK(12); QWEN_UNPACK(16); QWEN_UNPACK(30); QWEN_UNPACK(39);
+            QWEN_UNPACK(12); QWEN_UNPACK(14); QWEN_UNPACK(16); QWEN_UNPACK(30); QWEN_UNPACK(39);
             default: return 0;
             }
 #undef QWEN_UNPACK
